@@ -1,7 +1,7 @@
 # PAdES-LTA Renewer 🔏⏱️
 
-> Sistema automatizado y servicio web para la preservación a largo plazo y renovación de sellos de tiempo en documentos PDF firmados digitalmente (**PAdES-B-LTA** / ETSI EN 319 142).  
-> Proyecto de Investigación --- **CI-0140 Calidad de Software** (Universidad de Costa Rica).
+> Sistema automatizado y servicio web minimalista para la preservación a largo plazo y renovación de sellos de tiempo en documentos PDF firmados digitalmente (**PAdES-B-LTA** / ETSI EN 319 142).  
+> Proyecto de Investigación — **CI-0140 Calidad de Software** (Universidad de Costa Rica).
 
 ---
 
@@ -9,18 +9,21 @@
 
 Este proyecto implementa una solución de código abierto y servicio web para extender la validez jurídica de documentos electrónicos con firma digital certificada, conforme a la **Ley N° 8454** y la **Política de Formatos Oficiales V.4.0** del MICITT de Costa Rica.
 
-El sistema se conecta a la **Autoridad de Estampado de Tiempo del SINPE (TSA-SINPE)** operada por el Banco Central de Costa Rica (BCCR) mediante el protocolo estándar **RFC 3161** sobre HTTP, permitiendo inyectar sellos documentales de archivo y evidencias LTV de forma incremental.
+El sistema se conecta a la **Autoridad de Estampado de Tiempo del SINPE (TSA-SINPE)** operada por el Banco Central de Costa Rica (BCCR) mediante el protocolo estándar **RFC 3161** sobre HTTP, e incluye:
+
+- **Cliente TSA-SINPE (`tsa_client.py`)**: Generación y parseo de `TimeStampReq` / `TimeStampResp` (ASN.1 DER).
+- **Inspector PKI (`pki_inspector.py`)**: Reconstrucción completa de ramas X.509 hasta la CA Raíz (vía certificados embebidos, `/DSS` y `AIA`), consulta de revocación **OCSP** (RFC 6960) y **CRL** (RFC 5280), verificación de integridad `/ByteRange`, políticas de certificación (OID/CPS) y análisis de vigencia de autoridades raíz e intermedias.
+- **Inyector Incremental PAdES-B-LTA (`pdf_injector.py`)**: Actualizaciones incrementales PDF ISO 32000-1/2 para insertar evidencias LTV en `/DSS` (**PAdES-B-LT**) y sellos documentales `/DocTimeStamp` (`ETSI.RFC3161`) sin invalidar firmas anteriores (**PAdES-B-LTA**).
+- **Interfaz Web Minimalista (`web/`)**: Zona de arrastrar y soltar PDFs con confirmación inmediata, descarga directa e inspección desplegable de toda la jerarquía PKI hasta la raíz.
 
 ---
 
-## 🚀 Prueba de Concepto (POC) - Consumo de la TSA-SINPE
-
-El repositorio incluye un cliente Python modular y un script interactivo para demostrar el consumo del servicio de sellado oficial del BCCR.
+## 🚀 Instalación y Ejecución
 
 ### 1. Requisitos Previos
 
 * Python 3.10 o superior.
-* Conexión a Internet (para alcanzar el endpoint público `http://tsa.sinpe.fi.cr/tsaHttp/`).
+* Conexión a Internet (para alcanzar el endpoint público `http://tsa.sinpe.fi.cr/tsaHttp/` y repositorios AIA/OCSP/CRL del SINPE/MICITT).
 
 ### 2. Instalación de Dependencias
 
@@ -28,48 +31,44 @@ El repositorio incluye un cliente Python modular y un script interactivo para de
 pip install -r requirements.txt
 ```
 
-O instalando en modo desarrollo editable:
+O en modo desarrollo editable:
 
 ```bash
 pip install -e .
 ```
 
-### 3. Ejecutar la Prueba de Concepto
+### 3. Iniciar la Interfaz Web Minimalista
 
-Para sellar un buffer de prueba en memoria:
+```bash
+python3 run_web.py
+```
+
+Abra su navegador en `http://127.0.0.1:5050` (puede cambiar el puerto con la variable `PORT`). Arrastre uno o varios PDFs para renovarlos en memoria a **PAdES-B-LTA**, descargar el resultado y explorar la cadena completa hasta la **CA Raíz Nacional**.
+
+### 4. Uso por Línea de Comandos (CLI)
+
+**Inyectar `/DSS` + `/DocTimeStamp` directamente en un PDF:**
+
+```bash
+python3 examples/inject_pades_lta.py "/ruta/al/documento.pdf"
+```
+
+El documento renovado se guarda en `output/<nombre>_LTA.pdf` (o en la ruta especificada como segundo argumento).
+
+**Prueba de Concepto (consumo directo de token `.tst` desde TSA-SINPE):**
 
 ```bash
 python3 examples/poc_tsa_sinpe.py
 ```
 
-Para sellar un archivo específico (por ejemplo un PDF):
-
-```bash
-python3 examples/poc_tsa_sinpe.py ruta/a/tu_documento.pdf
-```
-
-### 4. Inspección del Token Recibido con OpenSSL
-
-El script guarda el token ASN.1 DER generado en `output/sample_sinpe_timestamp.tst`. Puedes examinar sus atributos criptográficos con:
-
-```bash
-openssl ts -reply -in output/sample_sinpe_timestamp.tst -text
-```
-
-Verás:
-* La fecha y hora oficial UTC de Costa Rica.
-* El OID de la Política Nacional: `2.16.188.1.1.1.1.5`.
-* El número de serie único emitido por la TSA-SINPE.
-* El certificado firmante de la jerarquía nacional de certificadores.
-
 ---
 
 ## 🧪 Pruebas Automatizadas
 
-Para ejecutar las pruebas unitarias y de integración:
+Para ejecutar las pruebas unitarias e integración:
 
 ```bash
-pytest -v
+PYTHONPATH=src pytest -v
 ```
 
 ---
