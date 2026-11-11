@@ -76,7 +76,7 @@ pytest -v
 
 ## 👥 Autores
 * Gabriel Serrano Rojas (C17497)
-* Josué Torres Sibaja (C37853)
+* Josue Torres Sibaja (C37853)
 
 **Profesor Guía:** Ph.D. Alexander Barquero Elizondo  
 **Institución:** Universidad de Costa Rica (UCR)

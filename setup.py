@@ -4,7 +4,7 @@ setup(
     name="pades-lta-renewer",
     version="0.1.0",
     description="Motor de preservación y renovación de sellos de tiempo PAdES-B-LTA",
-    author="Gabriel Serrano Rojas, Josué Torres Sibaja",
+    author="Gabriel Serrano Rojas, Josue Torres Sibaja",
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     python_requires=">=3.10",
