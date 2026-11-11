@@ -12,6 +12,8 @@ setup(
         "asn1crypto>=1.5.1",
         "requests>=2.28.0",
         "cryptography>=3.4.0",
+        "pypdf>=6.0.0",
+        "Flask>=2.3.0",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
