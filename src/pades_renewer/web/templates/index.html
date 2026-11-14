@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>PAdES-LTA Renewer</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="page-header">
+        <h1>PAdES-LTA Renewer</h1>
+        <p class="lead">
+          Arrastre documentos PDF firmados para inyectar evidencias <code>/DSS</code> y sello
+          temporal RFC 3161 (TSA-SINPE).
+        </p>
+      </header>
+
+      <main>
+        <label
+          id="dropzone"
+          class="dropzone"
+          for="pdf-input"
+          aria-describedby="dropzone-hint"
+        >
+          <input
+            id="pdf-input"
+            class="visually-hidden"
+            type="file"
+            accept="application/pdf,.pdf"
+            multiple
+          />
+          <svg
+            class="dropzone-icon"
+            width="28"
+            height="28"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.75"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+            <polyline points="14 2 14 8 20 8" />
+            <line x1="12" y1="18" x2="12" y2="12" />
+            <polyline points="9 15 12 12 15 15" />
+          </svg>
+          <span class="dropzone-title">Suelte sus archivos PDF aquí o haga clic para seleccionarlos</span>
+          <span id="dropzone-hint" class="dropzone-hint">
+            Procesamiento en memoria · Hasta 50 MB por archivo
+          </span>
+        </label>
+
+        <div id="live-status" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+
+        <section id="results" class="results" aria-label="Resultados de renovación"></section>
+      </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  </body>
+</html>
