@@ -35,8 +35,8 @@ from pades_renewer.tsa_client import TimestampResult
 from pades_renewer.web import create_app
 
 
-# Optional real-world sample: set PADES_REAL_PDF to the path of a signed PAdES PDF
-# to run test_real_costa_rica_pdf_live_renewal. Without it the test is skipped.
+# Muestra real opcional: definir PADES_REAL_PDF con la ruta de un PDF PAdES firmado
+# para ejecutar test_real_costa_rica_pdf_live_renewal. Sin ella, la prueba se omite.
 _REAL_PDF_ENV = os.environ.get("PADES_REAL_PDF", "").strip()
 REAL_SAMPLE_PDF = Path(_REAL_PDF_ENV) if _REAL_PDF_ENV else None
 
