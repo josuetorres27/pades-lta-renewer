@@ -35,9 +35,9 @@ def main():
     if len(sys.argv) > 1:
         target_path = Path(sys.argv[1])
         if not target_path.is_file():
-            print(f"❌ Error: El archivo '{target_path}' no existe.")
+            print(f"Error: El archivo '{target_path}' no existe.")
             sys.exit(1)
-        print(f"📄 Leyendo archivo objetivo: {target_path}")
+        print(f"Leyendo archivo objetivo: {target_path}")
         with open(target_path, "rb") as f:
             sample_data = f.read()
         label = target_path.name
@@ -70,12 +70,12 @@ def main():
     print("=" * 80)
 
     if not result.is_granted:
-        print(f"❌ La solicitud NO fue concedida.")
+        print(f"La solicitud NO fue concedida.")
         print(f"   Estado: {result.status}")
         print(f"   Mensaje de error: {result.error_message}")
         sys.exit(1)
 
-    print("✅ ESTAMPA DE TIEMPO EMITIDA SATISFACTORIAMENTE (Status: GRANTED)\n")
+    print("ESTAMPA DE TIEMPO EMITIDA SATISFACTORIAMENTE (Status: GRANTED)\n")
     print(f"   • Politica TSA (OID):       {result.policy_oid}")
     print(f"   • Numero de Serie del TST:  {result.serial_number}")
 
@@ -101,7 +101,7 @@ def main():
         f.write(result.raw_token_der)
 
     print("\n" + "-" * 80)
-    print(f"💾 Token guardado para inspeccion o inyeccion en PDF:")
+    print(f"Token guardado para inspeccion o inyeccion en PDF:")
     print(f"   Ruta: {tst_file}")
     print(f"   Para inspeccionar con OpenSSL ejecute en su terminal:")
     print(f"   $ openssl ts -reply -in output/sample_sinpe_timestamp.tst -text")
