@@ -8,7 +8,7 @@ from datetime import datetime
 import os
 from typing import Optional, Union, Dict, Any
 import requests
-from asn1crypto import tsp, algos, cms
+from asn1crypto import tsp, algos
 
 from .utils import compute_hash
 
