@@ -207,4 +207,4 @@ This project is licensed under the [MIT License](LICENSE).
 
 ---
 
-Created by **Gabriel Serrano Rojas** ([LinkedIn](https://www.linkedin.com/in/gabrielserranor/) · [GitHub](https://github.com/GabrielSerranoUCR)) and **Josue Torres Sibaja** ([Portfolio](https://josuetorressibaja.com/) · [LinkedIn](https://www.linkedin.com/in/josue-torres-sibaja/) · [GitHub](https://github.com/josuetorres27))
+Created by **Gabriel Serrano Rojas** ([LinkedIn](https://www.linkedin.com/in/gabrielserranor/) · [GitHub](https://github.com/GabrielSerranoUCR)) and **Josue Torres Sibaja** ([Portfolio](https://josuetorressibaja.com/) · [LinkedIn](https://www.linkedin.com/in/josue-torres-sibaja/) · [Email](mailto:dev.josue.torres@gmail.com))
