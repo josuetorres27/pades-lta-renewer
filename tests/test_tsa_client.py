@@ -3,8 +3,8 @@ Pruebas unitarias y de integración para el cliente TSA-SINPE (RFC 3161).
 """
 
 import hashlib
-import pytest
-from pades_renewer.tsa_client import TSASinpeClient, TimestampResult
+
+from pades_renewer.tsa_client import TSASinpeClient
 from pades_renewer.utils import compute_hash
 
 

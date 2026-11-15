@@ -33,6 +33,7 @@ from asn1crypto import cms
 
 from .pki_inspector import (
     CertificatePool,
+    _dss_objects,
     _extract_tst_details,
     build_chain_to_root,
     inspect_pdf,
@@ -269,21 +270,31 @@ def _append_dss_revision(pdf_bytes: bytes, pool: CertificatePool) -> Tuple[bytes
     preserved_vri = None
 
     has_dss = "/DSS" in root_obj
+    dss_obj: Any = None
     if has_dss:
-        dss_obj = root_obj["/DSS"].get_object()
-        for ref in dss_obj.get("/Certs") or []:
+        try:
+            dss_obj = root_obj["/DSS"].get_object()
+        except Exception:
+            dss_obj = None
+        if not isinstance(dss_obj, DictionaryObject):
+            # Un /DSS que no es diccionario se descarta y se reconstruye desde cero.
+            has_dss = False
+            dss_obj = None
+
+    if has_dss and dss_obj is not None:
+        for ref in _dss_objects(dss_obj, "/Certs"):
             certs_refs.append(ref)
             try:
                 existing_cert_fps.add(hashlib.sha256(ref.get_object().get_data()).hexdigest())
             except Exception:
                 pass
-        for ref in dss_obj.get("/CRLs") or []:
+        for ref in _dss_objects(dss_obj, "/CRLs"):
             crls_refs.append(ref)
             try:
                 existing_crl_fps.add(hashlib.sha256(ref.get_object().get_data()).hexdigest())
             except Exception:
                 pass
-        for ref in dss_obj.get("/OCSPs") or []:
+        for ref in _dss_objects(dss_obj, "/OCSPs"):
             ocsps_refs.append(ref)
             try:
                 existing_ocsp_fps.add(hashlib.sha256(ref.get_object().get_data()).hexdigest())
@@ -506,17 +517,62 @@ def _build_doctimestamp_skeleton(
     return out, lt_pos, gt_pos, br_pos, contents_hex_len
 
 
+def _failure_result(
+    *,
+    algorithm: str,
+    error_message: str,
+    original_profile: str = "Desconocido",
+    field_name: Optional[str] = None,
+    dss_updated: bool = False,
+    dss_counts: Optional[Dict[str, int]] = None,
+    pre_inspection: Optional[Dict[str, Any]] = None,
+    effective_protection_until: Optional[str] = None,
+) -> RenewalResult:
+    """Construye el resultado de una renovación fallida (nunca lanza, siempre informa)."""
+    return RenewalResult(
+        success=False,
+        original_profile=original_profile,
+        new_profile=original_profile,
+        field_name=field_name,
+        hash_algorithm=algorithm,
+        tsa_timestamp_utc=None,
+        tsa_policy_oid=None,
+        tsa_serial_number=None,
+        dss_updated=dss_updated,
+        dss_counts=dss_counts or {"certs": 0, "crls": 0, "ocsps": 0},
+        effective_protection_until=effective_protection_until,
+        output_pdf_bytes=None,
+        pre_inspection=pre_inspection or {},
+        post_inspection=None,
+        error_message=error_message,
+    )
+
+
 def renew_pdf_to_lta(
     pdf_bytes: bytes,
     tsa_client: Optional[TSASinpeClient] = None,
     algorithm: str = "sha256",
     url_cache: Optional[Dict[str, Tuple[float, bytes]]] = None,
     token_buffer_bytes: int = DEFAULT_TOKEN_BUFFER_BYTES,
+    fetch_remote: bool = True,
 ) -> RenewalResult:
     """
     Ejecuta la renovación completa PAdES-B-LT (/DSS) + PAdES-B-LTA (/DocTimeStamp)
     sobre un PDF en memoria utilizando el cliente TSA-SINPE configurado.
+
+    ``fetch_remote=False`` restringe la recolección de evidencias a lo que ya viaja en el
+    documento (/DSS y CMS), útil para renovaciones controladas o auditorías sin red.
+
+    Los errores se informan en ``RenewalResult.error_message``; solo los argumentos inválidos
+    (algoritmo desconocido, búfer fuera de rango) levantan ``ValueError``.
     """
+    try:
+        hashlib.new(algorithm)
+    except (ValueError, TypeError):
+        raise ValueError(f"Algoritmo de hash no soportado: {algorithm!r}") from None
+    if not isinstance(token_buffer_bytes, int) or isinstance(token_buffer_bytes, bool) or token_buffer_bytes < 1:
+        raise ValueError("token_buffer_bytes debe ser un entero mayor o igual a 1.")
+
     client = tsa_client or TSASinpeClient()
 
     try:
@@ -526,49 +582,61 @@ def renew_pdf_to_lta(
                 if reader_check.decrypt("") == 0:
                     raise ValueError("El PDF está protegido con contraseña.")
             except Exception:
-                return RenewalResult(
-                    success=False,
-                    original_profile="Desconocido",
-                    new_profile="Desconocido",
-                    field_name=None,
-                    hash_algorithm=algorithm,
-                    tsa_timestamp_utc=None,
-                    tsa_policy_oid=None,
-                    tsa_serial_number=None,
-                    dss_updated=False,
-                    dss_counts={"certs": 0, "crls": 0, "ocsps": 0},
-                    effective_protection_until=None,
-                    output_pdf_bytes=None,
-                    pre_inspection={},
-                    post_inspection=None,
-                    error_message="El documento PDF está cifrado o protegido con contraseña; descífrelos antes de aplicar sellado PAdES-B-LTA.",
+                return _failure_result(
+                    algorithm=algorithm,
+                    error_message=(
+                        "El documento PDF está cifrado o protegido con contraseña; "
+                        "descífrelos antes de aplicar sellado PAdES-B-LTA."
+                    ),
                 )
         if len(reader_check.pages) == 0:
             raise ValueError("El documento PDF no contiene páginas válidas.")
     except Exception as exc:
-        return RenewalResult(
-            success=False,
-            original_profile="Desconocido",
-            new_profile="Desconocido",
-            field_name=None,
-            hash_algorithm=algorithm,
-            tsa_timestamp_utc=None,
-            tsa_policy_oid=None,
-            tsa_serial_number=None,
-            dss_updated=False,
-            dss_counts={"certs": 0, "crls": 0, "ocsps": 0},
-            effective_protection_until=None,
-            output_pdf_bytes=None,
-            pre_inspection={},
-            post_inspection=None,
+        return _failure_result(
+            algorithm=algorithm,
             error_message=f"No se pudo leer el documento PDF: {exc}",
         )
 
     effective_cache = url_cache if url_cache is not None else {}
-    pre_report = inspect_pdf(pdf_bytes, fetch_remote=True, url_cache=effective_cache)
+    pre_report = inspect_pdf(pdf_bytes, fetch_remote=fetch_remote, url_cache=effective_cache)
     pool: CertificatePool = pre_report.pop("_pool")
     original_profile = pre_report["pades_profile"]
 
+    try:
+        return _renew_inner(
+            pdf_bytes,
+            client,
+            algorithm,
+            effective_cache,
+            token_buffer_bytes,
+            pre_report,
+            pool,
+            original_profile,
+            fetch_remote=fetch_remote,
+        )
+    except Exception as exc:
+        return _failure_result(
+            algorithm=algorithm,
+            original_profile=original_profile,
+            dss_updated=False,
+            pre_inspection=pre_report,
+            effective_protection_until=pre_report.get("effective_protection_until"),
+            error_message=f"Error inesperado durante la renovación: {type(exc).__name__}: {exc}",
+        )
+
+
+def _renew_inner(
+    pdf_bytes: bytes,
+    client: Any,
+    algorithm: str,
+    effective_cache: Dict[str, Tuple[float, bytes]],
+    token_buffer_bytes: int,
+    pre_report: Dict[str, Any],
+    pool: CertificatePool,
+    original_profile: str,
+    fetch_remote: bool = True,
+) -> RenewalResult:
+    """Cuerpo de la renovación: /DSS, esqueleto /DocTimeStamp, sello y verificación final."""
     # Incorporar certificados y CRLs de la TSA activa dentro del pool antes de congelar /DSS
     _populate_active_tsa_evidence(client, pool, algorithm=algorithm)
 
@@ -596,7 +664,16 @@ def renew_pdf_to_lta(
 
         br_text = f"/ByteRange [0 {len1} {start2} {len2}]"
         if len(br_text) > len(BR_PLACEHOLDER):
-            raise ValueError("El tamaño del documento excede la capacidad de /ByteRange.")
+            return _failure_result(
+                algorithm=algorithm,
+                error_message="El tamaño del documento excede la capacidad de /ByteRange.",
+                original_profile=original_profile,
+                field_name=field_name,
+                dss_updated=dss_updated,
+                dss_counts=dss_counts,
+                pre_inspection=pre_report,
+                effective_protection_until=pre_report.get("effective_protection_until"),
+            )
         br_padded = (br_text[:-1] + (" " * (len(BR_PLACEHOLDER) - len(br_text))) + "]").encode("ascii")
         out[br_pos : br_pos + len(BR_PLACEHOLDER)] = br_padded
 
@@ -607,22 +684,15 @@ def renew_pdf_to_lta(
 
         ts_res = client.request_timestamp(digest=digest, algorithm=algorithm, cert_req=True)
         if not ts_res.is_granted or not ts_res.raw_token_der:
-            return RenewalResult(
-                success=False,
+            return _failure_result(
+                algorithm=algorithm,
+                error_message=ts_res.error_message or "La TSA rechazó la solicitud de estampa de tiempo.",
                 original_profile=original_profile,
-                new_profile=original_profile,
                 field_name=field_name,
-                hash_algorithm=algorithm,
-                tsa_timestamp_utc=None,
-                tsa_policy_oid=None,
-                tsa_serial_number=None,
                 dss_updated=dss_updated,
                 dss_counts=dss_counts,
-                effective_protection_until=pre_report.get("effective_protection_until"),
-                output_pdf_bytes=None,
                 pre_inspection=pre_report,
-                post_inspection=None,
-                error_message=ts_res.error_message or "La TSA rechazó la solicitud de estampa de tiempo.",
+                effective_protection_until=pre_report.get("effective_protection_until"),
             )
 
         token_hex = ts_res.raw_token_der.hex()
@@ -636,25 +706,18 @@ def renew_pdf_to_lta(
         buf_size = len(ts_res.raw_token_der) + 2048
 
     if final_pdf is None or ts_res is None:
-        return RenewalResult(
-            success=False,
+        return _failure_result(
+            algorithm=algorithm,
+            error_message="El tamaño del token RFC 3161 superó el espacio reservado en /Contents.",
             original_profile=original_profile,
-            new_profile=original_profile,
             field_name=field_name,
-            hash_algorithm=algorithm,
-            tsa_timestamp_utc=None,
-            tsa_policy_oid=None,
-            tsa_serial_number=None,
             dss_updated=dss_updated,
             dss_counts=dss_counts,
-            effective_protection_until=pre_report.get("effective_protection_until"),
-            output_pdf_bytes=None,
             pre_inspection=pre_report,
-            post_inspection=None,
-            error_message="El tamaño del token RFC 3161 superó el espacio reservado en /Contents.",
+            effective_protection_until=pre_report.get("effective_protection_until"),
         )
 
-    post_report = inspect_pdf_public(final_pdf, fetch_remote=True, url_cache=effective_cache)
+    post_report = inspect_pdf_public(final_pdf, fetch_remote=fetch_remote, url_cache=effective_cache)
 
     return RenewalResult(
         success=True,

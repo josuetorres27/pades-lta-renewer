@@ -12,7 +12,6 @@ Extrae y valida:
 - Análisis contextual del impacto de vencimiento o compromiso de la CA Raíz
 """
 
-from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 import hashlib
 import io
@@ -26,9 +25,11 @@ from asn1crypto import cms, crl, ocsp, pem, tsp, x509
 from cryptography import x509 as cx509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
 
 
 EXPIRING_SOON_DAYS = 180
+EMBEDDED_SOURCE_LABEL = "Embebido (/DSS)"
 
 
 def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -42,6 +43,54 @@ def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
 def _format_iso(dt: Optional[datetime]) -> Optional[str]:
     dt_utc = _ensure_utc(dt)
     return dt_utc.isoformat() if dt_utc else None
+
+
+def _is_stale(next_update_iso: Optional[str], reference_time: Optional[datetime] = None) -> Optional[bool]:
+    """True si la evidencia de revocación ya superó su ``nextUpdate`` (None si no lo declara)."""
+    if not next_update_iso:
+        return None
+    try:
+        next_update = _ensure_utc(datetime.fromisoformat(next_update_iso))
+    except ValueError:
+        return None
+    if next_update is None:
+        return None
+    return next_update < (_ensure_utc(reference_time) or datetime.now(timezone.utc))
+
+
+def _evidence_rank(item: Dict[str, Any]) -> Tuple[int, int, str, str]:
+    """
+    Prioriza la evidencia de revocación: primero una respuesta que declare revocación
+    (la revocación es permanente), luego la evidencia vigente y por último la más reciente.
+    """
+    return (
+        1 if item.get("status") == "revoked" else 0,
+        1 if item.get("stale") is False else 0,
+        str(item.get("next_update") or ""),
+        str(item.get("this_update") or ""),
+    )
+
+
+def _select_best_evidence(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Elige la evidencia más confiable de un conjunto ya evaluado."""
+    return max(candidates, key=_evidence_rank)
+
+
+def _dss_objects(dss_obj: Any, key: str) -> List[Any]:
+    """
+    Devuelve las referencias de ``/Certs``, ``/CRLs`` u ``/OCSPs`` normalizando los casos
+    que escriben un objeto suelto en lugar de un arreglo (o un /DSS corrupto).
+    """
+    if not isinstance(dss_obj, DictionaryObject):
+        return []
+    raw = dss_obj.get(key)
+    if raw is None:
+        return []
+    resolved = raw.get_object() if isinstance(raw, IndirectObject) else raw
+    if isinstance(resolved, (ArrayObject, list)):
+        return list(resolved)
+    return [raw]
+
 
 
 def _safe_url(url: str) -> str:
@@ -163,24 +212,42 @@ class CertificatePool:
         self._aia_cache: Dict[str, Optional[bytes]] = {}
         self._crl_cache: Dict[str, Optional[bytes]] = {}
         self._ocsp_cache: Dict[str, Optional[bytes]] = {}
+        # Evidencia embebida en el documento (/DSS), independiente de las descargas remotas.
+        self._embedded_crls: Dict[str, bytes] = {}
+        self._embedded_ocsps: Dict[str, bytes] = {}
 
     def add_cert(self, cert_der: bytes) -> str:
+        """
+        Registra un certificado y devuelve su huella SHA-256.
+
+        El DER se valida al entrar: asn1crypto parsea de forma perezosa y un objeto que solo
+        *parece* un certificado envenenaría después todas las búsquedas de emisor del pool.
+        """
         der = _load_cert_der(cert_der)
         fp = hashlib.sha256(der).hexdigest()
         if fp not in self._certs_by_sha256:
+            parsed = x509.Certificate.load(der)
+            parsed["tbs_certificate"]["serial_number"].native
+            parsed["signature_algorithm"]["algorithm"].native
             self._certs_by_sha256[fp] = der
-            self._parsed_certs[fp] = x509.Certificate.load(der)
+            self._parsed_certs[fp] = parsed
         return fp
 
     def add_crl(self, crl_der: bytes, source_key: Optional[str] = None) -> None:
-        key = source_key or hashlib.sha256(crl_der).hexdigest()
-        if key not in self._crl_cache:
-            self._crl_cache[key] = crl_der
+        """Registra una CRL; sin ``source_key`` se considera evidencia embebida (/DSS)."""
+        if source_key is None:
+            fp = hashlib.sha256(crl_der).hexdigest()
+            self._embedded_crls.setdefault(fp, crl_der)
+        else:
+            self._crl_cache.setdefault(source_key, crl_der)
 
     def add_ocsp(self, ocsp_der: bytes, source_key: Optional[str] = None) -> None:
-        key = source_key or hashlib.sha256(ocsp_der).hexdigest()
-        if key not in self._ocsp_cache:
-            self._ocsp_cache[key] = ocsp_der
+        """Registra una respuesta OCSP; sin ``source_key`` se considera evidencia embebida (/DSS)."""
+        if source_key is None:
+            fp = hashlib.sha256(ocsp_der).hexdigest()
+            self._embedded_ocsps.setdefault(fp, ocsp_der)
+        else:
+            self._ocsp_cache.setdefault(source_key, ocsp_der)
         try:
             resp = ocsp.OCSPResponse.load(ocsp_der)
             if resp["response_status"].native == "successful":
@@ -197,7 +264,7 @@ class CertificatePool:
     def all_crls_der(self) -> List[bytes]:
         seen = set()
         out = []
-        for val in self._crl_cache.values():
+        for val in list(self._crl_cache.values()) + list(self._embedded_crls.values()):
             if val:
                 fp = hashlib.sha256(val).hexdigest()
                 if fp not in seen:
@@ -208,7 +275,7 @@ class CertificatePool:
     def all_ocsps_der(self) -> List[bytes]:
         seen = set()
         out = []
-        for val in self._ocsp_cache.values():
+        for val in list(self._ocsp_cache.values()) + list(self._embedded_ocsps.values()):
             if val:
                 fp = hashlib.sha256(val).hexdigest()
                 if fp not in seen:
@@ -344,13 +411,13 @@ class CertificatePool:
                 self._ocsp_cache[cache_key] = None
 
         candidates = []
-        if cache_key in self._ocsp_cache:
-            candidates.append((self._ocsp_cache.get(cache_key), ocsp_url))
-        elif not self.fetch_remote:
-            # Buscar dentro de respuestas OCSP embebidas en el PDF (/DSS)
-            for val in self._ocsp_cache.values():
-                if val:
-                    candidates.append((val, "Embebido (/DSS)"))
+        remote_result = self._ocsp_cache.get(cache_key)
+        if remote_result:
+            candidates.append((remote_result, ocsp_url))
+        # La evidencia embebida (/DSS) sigue siendo válida aunque la consulta remota falle,
+        # esté deshabilitada o el respondedor no tenga la respuesta de este certificado.
+        for embedded_ocsp in self._embedded_ocsps.values():
+            candidates.append((embedded_ocsp, EMBEDDED_SOURCE_LABEL))
 
         for raw_ocsp, src_label in candidates:
             if not raw_ocsp:
@@ -375,14 +442,16 @@ class CertificatePool:
                             rev_time = _format_iso(rev_info["revocation_time"].native)
                             if rev_info["revocation_reason"]:
                                 rev_reason = str(rev_info["revocation_reason"].native)
+                        next_update = _format_iso(single["next_update"].native) if single["next_update"] else None
                         return {
                             "status": cstatus,
                             "method": "OCSP",
                             "this_update": _format_iso(single["this_update"].native),
-                            "next_update": _format_iso(single["next_update"].native) if single["next_update"] else None,
+                            "next_update": next_update,
                             "revocation_time": rev_time,
                             "revocation_reason": rev_reason,
                             "source_url": src_label,
+                            "stale": _is_stale(next_update),
                             "der_bytes": raw_ocsp,
                         }
             except Exception:
@@ -413,11 +482,11 @@ class CertificatePool:
             if raw_crl:
                 candidates.append((raw_crl, url))
 
-        if not candidates and not self.fetch_remote:
-            for val in self._crl_cache.values():
-                if val:
-                    candidates.append((val, "Embebido (/DSS)"))
+        # La CRL embebida (/DSS) es útil precisamente cuando la descarga remota falla.
+        for embedded_crl in self._embedded_crls.values():
+            candidates.append((embedded_crl, EMBEDDED_SOURCE_LABEL))
 
+        evaluated: List[Dict[str, Any]] = []
         for raw_crl, src_label in candidates:
             try:
                 crl_obj = crl.CertificateList.load(raw_crl)
@@ -437,20 +506,26 @@ class CertificatePool:
                 if rev_entry is not None:
                     rev_time = _format_iso(rev_entry["revocation_date"].native)
 
-                return {
+                next_update = _format_iso(tbs["next_update"].native) if tbs["next_update"] else None
+                evaluated.append({
                     "status": status,
                     "method": "CRL",
                     "this_update": _format_iso(tbs["this_update"].native),
-                    "next_update": _format_iso(tbs["next_update"].native) if tbs["next_update"] else None,
+                    "next_update": next_update,
                     "revocation_time": rev_time,
                     "revocation_reason": None,
                     "source_url": src_label,
                     "entries_count": len(revoked_list) if revoked_list else 0,
+                    "stale": _is_stale(next_update),
                     "der_bytes": raw_crl,
-                }
+                })
             except Exception:
                 continue
-        return None
+
+        if not evaluated:
+            return None
+        return _select_best_evidence(evaluated)
+
 
 
 def parse_certificate_details(
@@ -786,32 +861,73 @@ def build_chain_to_root(
 
 
 def _match_signer_cert(signed_data: cms.SignedData, sid: cms.SignerIdentifier) -> Optional[bytes]:
+    """
+    Localiza el certificado del firmante referido por ``sid``.
+
+    Se compara primero la codificación DER exacta del emisor y luego su valor normalizado
+    (un mismo DN puede codificarse como PrintableString o UTF8String). Si la firma embebe un
+    único certificado, ese es el firmante por descarte; con varios candidatos y sin coincidencia
+    se devuelve ``None`` en lugar de atribuir la firma a un certificado cualquiera.
+    """
     if not signed_data["certificates"]:
         return None
+    candidates = []
     for c in signed_data["certificates"]:
-        cand = c.chosen
-        if sid.name == "issuer_and_serial_number":
+        try:
+            candidates.append(c.chosen)
+        except Exception:
+            continue
+    if not candidates:
+        return None
+
+    if sid.name == "issuer_and_serial_number":
+        serial = sid.chosen["serial_number"].native
+        issuer_dump = sid.chosen["issuer"].dump()
+        issuer_native = sid.chosen["issuer"].native
+        for cand in candidates:
+            tbs = cand["tbs_certificate"]
             if (
-                cand["tbs_certificate"]["serial_number"].native == sid.chosen["serial_number"].native
-                and cand["tbs_certificate"]["issuer"].dump() == sid.chosen["issuer"].dump()
+                tbs["serial_number"].native == serial
+                and tbs["issuer"].dump() == issuer_dump
             ):
                 return cand.dump()
-        elif sid.name == "subject_key_identifier":
-            if _get_ski(cand) == sid.chosen.native:
+        for cand in candidates:
+            tbs = cand["tbs_certificate"]
+            if tbs["serial_number"].native == serial and tbs["issuer"].native == issuer_native:
                 return cand.dump()
-    return signed_data["certificates"][0].chosen.dump()
+    elif sid.name == "subject_key_identifier":
+        target_ski = sid.chosen.native
+        for cand in candidates:
+            if _get_ski(cand) == target_ski:
+                return cand.dump()
+
+    if len(candidates) == 1:
+        return candidates[0].dump()
+    return None
 
 
 def _extract_tst_details(token_content_info: cms.ContentInfo, pool: CertificatePool) -> Dict[str, Any]:
     """Extrae metadatos del TSTInfo y certificados de una estampa RFC 3161."""
+    content_type = token_content_info["content_type"].native
+    if content_type != "signed_data":
+        raise ValueError(f"El token de sello no es CMS SignedData (content_type={content_type}).")
     signed_data = token_content_info["content"]
     if signed_data["certificates"]:
         for c in signed_data["certificates"]:
-            pool.add_cert(c.chosen.dump())
+            try:
+                pool.add_cert(c.chosen.dump())
+            except Exception:
+                continue
 
     encap = signed_data["encap_content_info"]
-    tst_info = tsp.TSTInfo.load(encap["content"].parsed.dump())
+    if not encap["content"]:
+        raise ValueError("El token de sello no incluye su TSTInfo (encap_content_info.content ausente).")
+    try:
+        tst_info = tsp.TSTInfo.load(encap["content"].parsed.dump())
+    except Exception as exc:
+        raise ValueError(f"El TSTInfo del sello no se puede interpretar: {exc}") from None
     gen_time = _ensure_utc(tst_info["gen_time"].native)
+
 
     tsa_cert_der = None
     if signed_data["certificates"] and signed_data["signer_infos"]:
@@ -847,6 +963,213 @@ def _compute_byterange_hash(pdf_bytes: bytes, byte_range: List[int], hash_alg: s
         return None
 
 
+def _parse_byte_range(vobj: Any) -> List[int]:
+    """Devuelve /ByteRange como enteros, o ``[]`` si el campo falta o es ilegible."""
+    if "/ByteRange" not in vobj:
+        return []
+    try:
+        return [int(x) for x in vobj["/ByteRange"]]
+    except (TypeError, ValueError):
+        return []
+
+
+def _read_signature_contents(vobj: Any) -> bytes:
+    """Devuelve /Contents como bytes; falla con ValueError si el objeto no es una cadena."""
+    raw = vobj.get("/Contents")
+    if raw is None:
+        return b""
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+    try:
+        return bytes(raw)
+    except TypeError:
+        raise ValueError("El campo /Contents de la firma no es una cadena de bytes.") from None
+
+
+def _load_legacy_certificate(raw_contents: bytes) -> Optional[x509.Certificate]:
+    """Reconoce un contenedor heredado (/adbe.x509.rsa_sha1) que guarda el certificado X.509 directo."""
+    try:
+        cert = x509.Certificate.load(raw_contents)
+        # asn1crypto parsea de forma perezosa: tocar los campos obligatorios valida el DER.
+        cert["tbs_certificate"]["serial_number"].native
+        cert["signature_algorithm"]["algorithm"].native
+        cert["tbs_certificate"]["subject"].dump()
+        return cert
+    except Exception:
+        return None
+
+
+def _inspect_signature_entry(
+    field_name: str,
+    vobj: Any,
+    pdf_bytes: bytes,
+    pool: CertificatePool,
+    now: datetime,
+) -> Optional[Dict[str, Any]]:
+    """
+    Interpreta un diccionario de firma o de sello documental.
+
+    Devuelve ``None`` cuando el campo no tiene contenido. Lanza ``ValueError`` cuando el
+    contenido no se puede interpretar: el llamador lo registra como firma ilegible en lugar
+    de abortar la inspección completa del documento.
+    """
+    sig_type = str(vobj.get("/Type") or "/Sig")
+    subfilter = str(vobj.get("/SubFilter") or "")
+    filter_name = str(vobj.get("/Filter") or "")
+    byte_range = _parse_byte_range(vobj)
+    raw_contents = _read_signature_contents(vobj)
+    if not raw_contents:
+        return None
+
+    claimed_date = str(vobj.get("/M") or "") or None
+    reason = str(vobj.get("/Reason") or "") or None
+    is_doc_ts = sig_type == "/DocTimeStamp" or subfilter == "/ETSI.RFC3161"
+    covers_whole_doc = bool(
+        len(byte_range) == 4
+        and byte_range[0] == 0
+        and (byte_range[2] + byte_range[3]) == len(pdf_bytes)
+    )
+
+    try:
+        info = cms.ContentInfo.load(raw_contents)
+        # asn1crypto parsea de forma perezosa: leer el OID aquí detecta los contenedores que
+        # no son CMS (p. ej. /adbe.x509.rsa_sha1, que guarda el certificado X.509 directo).
+        content_type = info["content_type"].native
+    except Exception as cms_error:
+        legacy_cert = None if is_doc_ts else _load_legacy_certificate(raw_contents)
+        if legacy_cert is None:
+            raise ValueError(f"el contenido de la firma no es un CMS SignedData válido ({cms_error})") from None
+        branch = build_chain_to_root(legacy_cert.dump(), pool, role_hint="firmante", reference_time=now)
+        return {
+            "field_name": field_name,
+            "kind": "signature",
+            "container": "x509",
+            "type": sig_type,
+            "subfilter": subfilter,
+            "filter": filter_name,
+            "claimed_date": claimed_date,
+            "reason": reason,
+            "digest_algorithm": None,
+            "byte_range": byte_range,
+            "covers_whole_document": covers_whole_doc,
+            "byterange_hash_valid": None,
+            "signer_certificate_found": True,
+            "embedded_timestamp": None,
+            "branches": [branch],
+            "notes": (
+                "Contenedor X.509 heredado (sin atributos CMS): el certificado del firmante "
+                "es interpretable, pero el documento no embebe un digest que se pueda recomputar."
+            ),
+        }
+
+    if content_type != "signed_data":
+        raise ValueError(f"el contenedor CMS es '{content_type}' y no signed_data")
+    signed_data = info["content"]
+    if signed_data["certificates"]:
+        for c in signed_data["certificates"]:
+            try:
+                pool.add_cert(c.chosen.dump())
+            except Exception:
+                continue
+
+    if is_doc_ts:
+        tst_meta = _extract_tst_details(info, pool)
+        computed = _compute_byterange_hash(pdf_bytes, byte_range, tst_meta["hash_algorithm"])
+        hash_matches = bool(computed and computed.hex() == tst_meta["hashed_message_hex"])
+        tsa_branch = (
+            build_chain_to_root(tst_meta["tsa_cert_der"], pool, role_hint="tsa", reference_time=now)
+            if tst_meta["tsa_cert_der"]
+            else None
+        )
+        return {
+            "field_name": field_name,
+            "kind": "doc_timestamp",
+            "type": sig_type,
+            "subfilter": subfilter,
+            "filter": filter_name,
+            "byte_range": byte_range,
+            "covers_whole_document": covers_whole_doc,
+            "byterange_hash_valid": hash_matches,
+            "timestamp": {k: v for k, v in tst_meta.items() if k != "tsa_cert_der"},
+            "branches": [tsa_branch] if tsa_branch else [],
+        }
+
+    signer_infos = signed_data["signer_infos"]
+    if not signer_infos:
+        raise ValueError("el contenedor CMS no incluye ningún SignerInfo")
+    signer_info = signer_infos[0]
+    digest_alg = str(signer_info["digest_algorithm"]["algorithm"].native)
+    computed = _compute_byterange_hash(pdf_bytes, byte_range, digest_alg)
+
+    msg_digest_attr = None
+    if signer_info["signed_attrs"]:
+        for attr in signer_info["signed_attrs"]:
+            if attr["type"].native == "message_digest":
+                msg_digest_attr = attr["values"][0].native
+                break
+    hash_matches = bool(computed and msg_digest_attr and computed == msg_digest_attr)
+
+    # Ubicar certificado del firmante
+    signer_cert_der = _match_signer_cert(signed_data, signer_info["sid"])
+
+    branches: List[Dict[str, Any]] = []
+    if signer_cert_der:
+        branches.append(build_chain_to_root(signer_cert_der, pool, role_hint="firmante", reference_time=now))
+
+    # Verificar si tiene estampa de tiempo embebida (signature_time_stamp_token)
+    embedded_tst_meta = None
+    if signer_info["unsigned_attrs"]:
+        for attr in signer_info["unsigned_attrs"]:
+            if attr["type"].native == "signature_time_stamp_token":
+                tst_ci = cms.ContentInfo.load(attr["values"][0].dump())
+                embedded_tst_meta = _extract_tst_details(tst_ci, pool)
+                if embedded_tst_meta["tsa_cert_der"]:
+                    branches.append(
+                        build_chain_to_root(
+                            embedded_tst_meta["tsa_cert_der"],
+                            pool,
+                            role_hint="tsa",
+                            reference_time=now,
+                        )
+                    )
+                embedded_tst_meta = {k: v for k, v in embedded_tst_meta.items() if k != "tsa_cert_der"}
+                break
+
+    return {
+        "field_name": field_name,
+        "kind": "signature",
+        "type": sig_type,
+        "subfilter": subfilter,
+        "filter": filter_name,
+        "claimed_date": claimed_date,
+        "reason": reason,
+        "digest_algorithm": digest_alg,
+        "byte_range": byte_range,
+        "covers_whole_document": covers_whole_doc,
+        "byterange_hash_valid": hash_matches,
+        "signer_certificate_found": signer_cert_der is not None,
+        "embedded_timestamp": embedded_tst_meta,
+        "branches": branches,
+    }
+
+
+def _unreadable_signature_entry(field_name: str, vobj: Any, error: Exception) -> Dict[str, Any]:
+    """Registro de una firma cuyo contenido no se pudo interpretar."""
+    message = str(error) if isinstance(error, ValueError) else f"{type(error).__name__}: {error}"
+    return {
+        "field_name": field_name,
+        "kind": "unreadable",
+        "type": str(vobj.get("/Type") or "/Sig"),
+        "subfilter": str(vobj.get("/SubFilter") or ""),
+        "filter": str(vobj.get("/Filter") or ""),
+        "byte_range": _parse_byte_range(vobj),
+        "covers_whole_document": False,
+        "byterange_hash_valid": None,
+        "error": message,
+        "branches": [],
+    }
+
+
 def inspect_pdf(
     pdf_bytes: bytes,
     fetch_remote: bool = True,
@@ -864,35 +1187,48 @@ def inspect_pdf(
     pool = CertificatePool(fetch_remote=fetch_remote, url_cache=url_cache)
 
     root = reader.trailer["/Root"].get_object()
-    has_dss = "/DSS" in root
-    dss_summary = {"present": False, "certs_count": 0, "crls_count": 0, "ocsps_count": 0}
+    dss_summary: Dict[str, Any] = {
+        "present": False,
+        "certs_count": 0,
+        "crls_count": 0,
+        "ocsps_count": 0,
+        "malformed": False,
+        "error": None,
+    }
+    warnings: List[str] = []
 
-    if has_dss:
-        dss = root["/DSS"].get_object()
-        certs_arr = dss.get("/Certs") or []
-        crls_arr = dss.get("/CRLs") or []
-        ocsps_arr = dss.get("/OCSPs") or []
-        for ref in certs_arr:
-            try:
-                pool.add_cert(ref.get_object().get_data())
-            except Exception:
-                pass
-        for ref in crls_arr:
-            try:
-                pool.add_crl(ref.get_object().get_data())
-            except Exception:
-                pass
-        for ref in ocsps_arr:
-            try:
-                pool.add_ocsp(ref.get_object().get_data())
-            except Exception:
-                pass
-        dss_summary = {
-            "present": True,
-            "certs_count": len(certs_arr),
-            "crls_count": len(crls_arr),
-            "ocsps_count": len(ocsps_arr),
-        }
+    if "/DSS" in root:
+        try:
+            dss = root["/DSS"].get_object()
+            if not isinstance(dss, DictionaryObject):
+                raise ValueError(f"el diccionario /DSS es un {type(dss).__name__} y no un diccionario")
+            certs_arr = _dss_objects(dss, "/Certs")
+            crls_arr = _dss_objects(dss, "/CRLs")
+            ocsps_arr = _dss_objects(dss, "/OCSPs")
+            for ref in certs_arr:
+                try:
+                    pool.add_cert(ref.get_object().get_data())
+                except Exception:
+                    pass
+            for ref in crls_arr:
+                try:
+                    pool.add_crl(ref.get_object().get_data())
+                except Exception:
+                    pass
+            for ref in ocsps_arr:
+                try:
+                    pool.add_ocsp(ref.get_object().get_data())
+                except Exception:
+                    pass
+            dss_summary.update({
+                "present": True,
+                "certs_count": len(certs_arr),
+                "crls_count": len(crls_arr),
+                "ocsps_count": len(ocsps_arr),
+            })
+        except Exception as exc:
+            dss_summary.update({"present": True, "malformed": True, "error": str(exc)})
+            warnings.append(f"El diccionario /DSS del documento está mal formado: {exc}")
 
     fields = reader.get_fields() or {}
     sig_entries: List[Tuple[int, str, Dict[str, Any]]] = []
@@ -900,121 +1236,35 @@ def inspect_pdf(
         fobj = fref.get_object()
         if "/V" in fobj:
             vobj = fobj["/V"].get_object()
-            br = [int(x) for x in vobj.get("/ByteRange", [])] if "/ByteRange" in vobj else []
+            br = _parse_byte_range(vobj)
             order_key = br[1] if len(br) >= 2 else 0
             sig_entries.append((order_key, str(fname), vobj))
 
     sig_entries.sort(key=lambda item: item[0])
 
     signatures_out: List[Dict[str, Any]] = []
-    has_timestamp = False
-    has_doctimestamp = False
     now = datetime.now(timezone.utc)
 
     for _, field_name, vobj in sig_entries:
-        sig_type = str(vobj.get("/Type") or "/Sig")
-        subfilter = str(vobj.get("/SubFilter") or "")
-        filter_name = str(vobj.get("/Filter") or "")
-        byte_range = [int(x) for x in vobj.get("/ByteRange", [])] if "/ByteRange" in vobj else []
-        raw_contents = bytes(vobj.get("/Contents") or b"")
-        if not raw_contents:
-            continue
-        claimed_date = str(vobj.get("/M") or "") or None
-        reason = str(vobj.get("/Reason") or "") or None
+        try:
+            entry = _inspect_signature_entry(field_name, vobj, pdf_bytes, pool, now)
+        except Exception as exc:
+            entry = _unreadable_signature_entry(field_name, vobj, exc)
+            warnings.append(f"La firma «{field_name}» no se pudo interpretar: {entry['error']}")
+        if entry is not None:
+            signatures_out.append(entry)
 
-        info = cms.ContentInfo.load(raw_contents)
-        signed_data = info["content"]
-        if signed_data["certificates"]:
-            for c in signed_data["certificates"]:
-                pool.add_cert(c.chosen.dump())
-
-        is_doc_ts = sig_type == "/DocTimeStamp" or subfilter == "/ETSI.RFC3161"
-        covers_whole_doc = bool(len(byte_range) == 4 and byte_range[0] == 0 and (byte_range[2] + byte_range[3]) == len(pdf_bytes))
-
-        if is_doc_ts:
-            has_doctimestamp = True
-            has_timestamp = True
-            tst_meta = _extract_tst_details(info, pool)
-            computed = _compute_byterange_hash(pdf_bytes, byte_range, tst_meta["hash_algorithm"])
-            hash_matches = bool(computed and computed.hex() == tst_meta["hashed_message_hex"])
-            tsa_branch = (
-                build_chain_to_root(tst_meta["tsa_cert_der"], pool, role_hint="tsa", reference_time=now)
-                if tst_meta["tsa_cert_der"]
-                else None
-            )
-
-            signatures_out.append({
-                "field_name": field_name,
-                "kind": "doc_timestamp",
-                "type": sig_type,
-                "subfilter": subfilter,
-                "filter": filter_name,
-                "byte_range": byte_range,
-                "covers_whole_document": covers_whole_doc,
-                "byterange_hash_valid": hash_matches,
-                "timestamp": {k: v for k, v in tst_meta.items() if k != "tsa_cert_der"},
-                "branches": [tsa_branch] if tsa_branch else [],
-            })
-        else:
-            signer_info = signed_data["signer_infos"][0]
-            digest_alg = str(signer_info["digest_algorithm"]["algorithm"].native)
-            computed = _compute_byterange_hash(pdf_bytes, byte_range, digest_alg)
-
-            msg_digest_attr = None
-            if signer_info["signed_attrs"]:
-                for attr in signer_info["signed_attrs"]:
-                    if attr["type"].native == "message_digest":
-                        msg_digest_attr = attr["values"][0].native
-                        break
-            hash_matches = bool(computed and msg_digest_attr and computed == msg_digest_attr)
-
-            # Ubicar certificado del firmante
-            signer_cert_der = _match_signer_cert(signed_data, signer_info["sid"])
-
-            branches: List[Dict[str, Any]] = []
-            if signer_cert_der:
-                branches.append(build_chain_to_root(signer_cert_der, pool, role_hint="firmante", reference_time=now))
-
-            # Verificar si tiene estampa de tiempo embebida (signature_time_stamp_token)
-            embedded_tst_meta = None
-            if signer_info["unsigned_attrs"]:
-                for attr in signer_info["unsigned_attrs"]:
-                    if attr["type"].native == "signature_time_stamp_token":
-                        has_timestamp = True
-                        tst_ci = cms.ContentInfo.load(attr["values"][0].dump())
-                        embedded_tst_meta = _extract_tst_details(tst_ci, pool)
-                        if embedded_tst_meta["tsa_cert_der"]:
-                            branches.append(
-                                build_chain_to_root(
-                                    embedded_tst_meta["tsa_cert_der"],
-                                    pool,
-                                    role_hint="tsa",
-                                    reference_time=now,
-                                )
-                            )
-                        embedded_tst_meta = {k: v for k, v in embedded_tst_meta.items() if k != "tsa_cert_der"}
-                        break
-
-            signatures_out.append({
-                "field_name": field_name,
-                "kind": "signature",
-                "type": sig_type,
-                "subfilter": subfilter,
-                "filter": filter_name,
-                "claimed_date": claimed_date,
-                "reason": reason,
-                "digest_algorithm": digest_alg,
-                "byte_range": byte_range,
-                "covers_whole_document": covers_whole_doc,
-                "byterange_hash_valid": hash_matches,
-                "embedded_timestamp": embedded_tst_meta,
-                "branches": branches,
-            })
+    has_doctimestamp = any(s["kind"] == "doc_timestamp" for s in signatures_out)
+    has_timestamp = has_doctimestamp or any(s.get("embedded_timestamp") for s in signatures_out)
+    readable = [s for s in signatures_out if s["kind"] != "unreadable"]
+    unreadable_count = len(signatures_out) - len(readable)
 
     # Clasificar perfil PAdES detectado
-    user_sigs_count = sum(1 for s in signatures_out if s["kind"] == "signature")
+    user_sigs_count = sum(1 for s in readable if s["kind"] == "signature")
     if not signatures_out:
         pades_profile = "Sin firma"
+    elif not readable:
+        pades_profile = "Desconocido"
     elif user_sigs_count == 0 and has_doctimestamp:
         pades_profile = "Sellado temporal (RFC 3161)"
     elif has_doctimestamp and dss_summary["present"]:
@@ -1046,11 +1296,13 @@ def inspect_pdf(
         "file_size_bytes": len(pdf_bytes),
         "pages_count": len(reader.pages),
         "signatures_count": len(signatures_out),
+        "unreadable_signatures": unreadable_count,
         "pades_profile": pades_profile,
         "dss": dss_summary,
         "any_signer_expired": any_signer_expired,
         "effective_protection_until": effective_protection_until,
         "signatures": signatures_out,
+        "warnings": warnings,
         "_pool": pool,
     }
 
