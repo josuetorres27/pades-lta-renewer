@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pades-lta-renewer"
+version = "0.1.0"
+description = "Motor de preservación y renovación de sellos de tiempo PAdES-B-LTA"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "Gabriel Serrano Rojas" },
+    { name = "Josue Torres Sibaja" },
+]
+keywords = ["pades", "pdf", "rfc3161", "timestamp", "x509", "ltv", "etsi", "costa-rica"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security :: Cryptography",
+]
+dependencies = [
+    "asn1crypto>=1.5.1",
+    "requests>=2.28.0",
+    "cryptography>=3.4.0",
+    "pypdf>=6.0.0",
+    "Flask>=2.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+pades-renewer = "pades_renewer.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/josuetorres27/pades-lta-renewer"
+Source = "https://github.com/josuetorres27/pades-lta-renewer"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"pades_renewer.web" = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["*.ipynb", "examples"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"run_web.py" = ["E402"]

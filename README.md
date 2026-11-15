@@ -16,7 +16,9 @@ It is a research project for the course CI-0140 Software Quality at the Universi
 ## Features
 
 - **TSA-SINPE Client (`tsa_client.py`):** Builds RFC 3161 `TimeStampReq` structures (SHA-256 by default, random 64-bit nonce, certificate request) in ASN.1 DER, sends them over HTTP POST to `http://tsa.sinpe.fi.cr/tsaHttp/` and parses the `TimeStampResp`: status, nonce match, generation time, policy OID, serial number and attached certificates.
-- **PKI Inspector (`pki_inspector.py`):** Lists every signature and document timestamp in a PDF, recomputes the `/ByteRange` digest and compares it with the CMS `messageDigest` attribute or the timestamp's message imprint, and builds each X.509 chain toward a self-signed root from embedded certificates, `/DSS` and AIA `caIssuers` downloads, verifying every certificate signature against its issuer.
+- **Command Line (`cli.py`):** `pades-renewer inspect` and `pades-renewer renew` subcommands, with human-readable or `--json` output, `--no-remote` for purely offline analysis and exit codes suitable for scripting.
+- **PKI Inspector (`pki_inspector.py`):** Lists every signature and document timestamp in a PDF, recomputes the `/ByteRange` digest and compares it with the CMS `messageDigest` attribute or the timestamp's message imprint, and builds each X.509 chain toward a self-signed root from embedded certificates, `/DSS` and AIA `caIssuers` downloads, verifying every certificate signature against its issuer. The evidence already carried by the document (`/DSS`) is always used, so a PAdES-B-LT file can be validated without network access, and revocation evidence past its `nextUpdate` is reported as stale instead of passing for current.
+- **Tolerant Inspection:** A signature whose `/Contents` is not a CMS container (a legacy `/adbe.x509.rsa_sha1` field, a truncated token, a field written by another signer) is reported as its own entry instead of aborting the analysis of the rest of the document, and a `/DSS` dictionary that is not a dictionary is flagged and rebuilt on renewal.
 - **Certificate Analysis:** Reports validity status per chain link (with a 180-day "expiring soon" threshold), role (signer, TSA, issuing CA, policy CA, root CA), key and signature algorithms, key usage, certificate policies (OID, explicit text, CPS URLs) and revocation status via OCSP (RFC 6960) and CRL (RFC 5280).
 - **Profile Detection:** Classifies the document as PAdES-B-B, PAdES-B-T, PAdES-B-LT or PAdES-B-LTA from the signatures, timestamps and `/DSS` dictionary it finds.
 - **Incremental Injector (`pdf_injector.py`):** Appends a `/DSS` revision (certificates, CRLs and OCSP responses, including the active TSA's chain) with `/Extensions` ADBE ExtensionLevel 8, then appends an invisible `/DocTimeStamp` field (`/SubFilter /ETSI.RFC3161`) whose `/Contents` holds the TSA-SINPE token. It supports both classic cross-reference tables and cross-reference streams and rejects encrypted PDFs.
@@ -53,8 +55,10 @@ It is a research project for the course CI-0140 Software Quality at the Universi
 
 - **Signature Checks:** The inspector compares `/ByteRange` digests and verifies certificate-chain signatures, but it does not verify the CMS signature value of signers, the signature of timestamp tokens or the signatures of OCSP responses and CRLs.
 - **Trust Anchors:** A chain "reaches the root" when it ends in a self-signed CA certificate; there is no configured trust store.
-- **Profile Detection:** The PAdES level is inferred from the presence of signatures, timestamps and `/DSS`; it is not a full ETSI conformance validation.
-- **Network Access:** Renewal needs access to TSA-SINPE and to the AIA, OCSP and CRL endpoints listed in the certificates.
+- **Profile Detection:** The PAdES level is inferred from the presence of signatures, timestamps and `/DSS`; it is not a full ETSI conformance validation. A document whose signatures cannot be interpreted at all is reported as `Desconocido` instead of being classified silently.
+- **Revocation Freshness:** Evidence past its `nextUpdate` is labelled `stale: true` in the report, but it is still the evidence used: validity is not re-evaluated at the signing or stamping time.
+- **Legacy Containers:** A signature stored as a bare X.509 certificate (`/adbe.x509.rsa_sha1`) yields its signer certificate and chain, but that container does not embed a digest, so its `/ByteRange` cannot be recomputed.
+- **Network Access:** Renewal needs access to TSA-SINPE and, unless `fetch_remote=False` or `--no-remote` is used, to the AIA, OCSP and CRL endpoints listed in the certificates.
 
 ---
 
@@ -63,11 +67,12 @@ It is a research project for the course CI-0140 Software Quality at the Universi
 ```text
 pades-lta-renewer/
 ├── examples/
-│   ├── inject_pades_lta.py      # CLI: renew a PDF to PAdES-B-LTA
+│   ├── inject_pades_lta.py      # Script: renew a PDF to PAdES-B-LTA
 │   └── poc_tsa_sinpe.py         # Proof of concept: request a token from TSA-SINPE
 ├── src/
 │   └── pades_renewer/
 │       ├── __init__.py
+│       ├── cli.py               # `pades-renewer` console entry point
 │       ├── pdf_injector.py      # Incremental /DSS and /DocTimeStamp injection
 │       ├── pki_inspector.py     # Signature, X.509 chain and revocation inspection
 │       ├── tsa_client.py        # RFC 3161 client for TSA-SINPE
@@ -81,14 +86,19 @@ pades-lta-renewer/
 │           └── templates/
 │               └── index.html
 ├── tests/
+│   ├── support_pki.py           # Synthetic PKI, CRL/OCSP and signed-PDF fixtures
+│   ├── test_cli.py
 │   ├── test_pki_and_injector.py
+│   ├── test_revocation_evidence.py
+│   ├── test_robust_inspection.py
 │   └── test_tsa_client.py
 ├── .gitignore
 ├── LICENSE
 ├── README.md
+├── conftest.py                  # Lets `pytest` run from a checkout, without installing
+├── pyproject.toml               # Packaging, console script and pytest/ruff config
 ├── requirements.txt
-├── run_web.py                   # Web interface launcher
-└── setup.py
+└── run_web.py                   # Web interface launcher
 ```
 
 ---
@@ -110,11 +120,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The dependencies are `asn1crypto`, `requests`, `cryptography`, `pypdf` and `Flask`. To install the package in editable mode instead:
+The dependencies are `asn1crypto`, `requests`, `cryptography`, `pypdf` and `Flask`. To install the package (and the `pades-renewer` command) in editable mode instead, with the test tooling:
 
 ```bash
-pip install -e .
+pip install -e ".[dev]"
 ```
+
+`pyproject.toml` declares the package, its dependencies, the console script and the `pytest`/`ruff` configuration; `templates/` and `static/` are shipped as package data so an installed copy can serve the web interface.
 
 ### Run
 
@@ -144,7 +156,24 @@ Drop one or more signed PDFs on the page. Each file is renewed in memory to PAdE
 
 ### Command Line
 
-Renew a PDF and write `output/<name>_LTA.pdf`, or the path given as the second argument:
+The installed package exposes `pades-renewer`. Inspect a document (add `--json` for the full report, `--no-remote` to use only the evidence carried by the PDF):
+
+```bash
+pades-renewer inspect "/path/to/document.pdf"
+pades-renewer inspect "/path/to/document.pdf" --no-remote --json
+```
+
+Renew it, writing `<name>_LTA.pdf` next to the original or the path given with `-o`:
+
+```bash
+pades-renewer renew "/path/to/document.pdf"
+pades-renewer renew "/path/to/document.pdf" -o "/path/to/renewed.pdf"
+pades-renewer renew "/path/to/document.pdf" --algorithm sha512 --token-buffer 16384
+```
+
+`pades-renewer` exits with `0` on success, `1` when the renewal fails (the reason goes to stderr) and `2` on usage errors, so it can drive a script or a pipeline. Without installing the package the same commands run as `python3 -m pades_renewer.cli`.
+
+The example scripts remain available and do the same through the Python API:
 
 ```bash
 python3 examples/inject_pades_lta.py "/path/to/document.pdf"
@@ -176,27 +205,33 @@ if result.success:
         f.write(result.output_pdf_bytes)
 ```
 
+Both functions accept `fetch_remote=False` to stay offline: only the certificates, CRL and OCSP responses already inside the document are used. `renew_pdf_to_lta` reports every failure in `RenewalResult.error_message` instead of raising, and only rejects invalid arguments (`algorithm`, `token_buffer_bytes`) with `ValueError`.
+
+The inspection report also carries the fields that describe what could not be verified: `unreadable_signatures` (plus a `warnings` list), `dss.malformed`/`dss.error` for a broken `/DSS` dictionary, `signature.signer_certificate_found`, and `revocation.stale` for evidence past its `nextUpdate`.
+
 ---
 
 ## Testing
 
-`pytest` is not listed in `requirements.txt`, so install it first:
+`pytest` is part of the `dev` extra (`pip install -e ".[dev]"`); a root `conftest.py` adds `src/` to `sys.path`, so the suite also runs from a plain checkout:
 
 ```bash
-pip install pytest
-PYTHONPATH=src pytest -v
+pytest -v
 ```
 
 | Test File | Tests | Scope |
 | :--- | :---: | :--- |
 | **`tests/test_tsa_client.py`** | 3 | Hashing, `TimeStampReq` structure and a live request to TSA-SINPE |
 | **`tests/test_pki_and_injector.py`** | 6 | Offline renewal with a synthetic PKI and mocked TSA (classic xref, xref stream, oversized token), Flask routes and validation, end-to-end web renewal and an optional live renewal of a real PDF |
-| **Total** | **9** | |
+| **`tests/test_revocation_evidence.py`** | 10 | `/DSS` evidence reused with and without network, `stale` evidence, fresh-over-stale selection, OCSP `CertID` hashes checked against an independent RFC 6960 computation, revocation propagated to the chain node and preserved across renewal |
+| **`tests/test_robust_inspection.py`** | 22 | Legacy `/adbe.x509.rsa_sha1` containers, unreadable signatures, empty `SignerInfo`, corrupt and single-reference `/DSS`, signer-certificate resolution, renewal of damaged documents, argument validation and non-raising error reporting |
+| **`tests/test_cli.py`** | 14 | `inspect`/`renew` output, `--json`, `-o`, hash algorithm, exit codes, `--version` and execution through `python -m pades_renewer.cli` |
+| **`Total`** | **55** | |
 
-`test_live_tsa_sinpe_request` needs network access to TSA-SINPE. `test_real_costa_rica_pdf_live_renewal` is skipped unless the `PADES_REAL_PDF` environment variable points to a signed PAdES-B-T PDF:
+Every test except the two live ones runs offline against `tests/support_pki.py`, which builds a synthetic PKI, real CRL and OCSP structures, signed PDFs and a local TSA. `test_live_tsa_sinpe_request` needs network access to TSA-SINPE. `test_real_costa_rica_pdf_live_renewal` is skipped unless the `PADES_REAL_PDF` environment variable points to a signed PAdES-B-T PDF:
 
 ```bash
-PADES_REAL_PDF="/path/to/signed.pdf" PYTHONPATH=src pytest -v
+PADES_REAL_PDF="/path/to/signed.pdf" pytest -v
 ```
 
 ---
